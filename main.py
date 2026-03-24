@@ -29,25 +29,35 @@ import openpyxl
 # ---------------------------------------------------------------------------
 
 def read_shipping_plan(filepath):
-    """读取发货计划，提取 (料件编号, 本周要求数量, 行号)"""
+    """读取送货单，提取 (料件编号, 数量, 行号)
+
+    新送货单格式：列B=产品料号，列E=数量，第8行起为数据行。
+    """
     wb = openpyxl.load_workbook(filepath, read_only=True)
     ws = wb.active
     items = []
-    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-        if len(row) < 7:
+    for row_idx, row in enumerate(ws.iter_rows(min_row=8, values_only=True), start=8):
+        if len(row) < 5:
             continue
-        part_no = row[3]   # 列 D: 料件编号
-        quantity = row[6]  # 列 G: 本周要求数量
-        if part_no and quantity is not None:
-            try:
-                qty = int(float(quantity))
-            except (ValueError, TypeError):
-                continue
-            items.append({
-                'row': row_idx,
-                'part_no': str(part_no).strip(),
-                'quantity': qty,
-            })
+        part_no = row[1]   # 列 B: 产品料号
+        quantity = row[4]  # 列 E: 数量
+        # 跳过合计行和空行
+        if not part_no or not str(part_no).strip():
+            continue
+        pn = str(part_no).strip()
+        if pn in ('合计', '总计'):
+            continue
+        if quantity is None:
+            continue
+        try:
+            qty = int(float(quantity))
+        except (ValueError, TypeError):
+            continue
+        items.append({
+            'row': row_idx,
+            'part_no': pn,
+            'quantity': qty,
+        })
     wb.close()
     return items
 
@@ -388,6 +398,7 @@ class App:
             except Exception:
                 pass
 
+        self.plan_paths = []  # 多个送货单路径
         self.print_tasks = []
         self.processing = False
         self.tree_items = {}  # part_no -> tree item id
@@ -410,7 +421,7 @@ class App:
 
         r1 = ttk.Frame(sel)
         r1.pack(fill='x', pady=3)
-        ttk.Label(r1, text="发货计划：", width=10,
+        ttk.Label(r1, text="送货单：", width=10,
                   font=("Microsoft YaHei", 10)).pack(side='left')
         self.plan_var = tk.StringVar()
         ttk.Entry(r1, textvariable=self.plan_var,
@@ -550,11 +561,15 @@ class App:
     # ---- 文件选择 ----
 
     def _pick_plan(self):
-        p = filedialog.askopenfilename(
-            title="选择发货计划",
+        paths = filedialog.askopenfilenames(
+            title="选择送货单（可多选）",
             filetypes=[("Excel 文件", "*.xlsx;*.xls"), ("所有文件", "*.*")])
-        if p:
-            self.plan_var.set(p)
+        if paths:
+            self.plan_paths = list(paths)
+            if len(paths) == 1:
+                self.plan_var.set(paths[0])
+            else:
+                self.plan_var.set(f"已选择 {len(paths)} 个送货单")
 
     def _pick_dir(self):
         d = filedialog.askdirectory(title="选择检验报告目录")
@@ -564,12 +579,14 @@ class App:
     # ---- 更新报告 ----
 
     def _on_update(self):
-        plan_path = self.plan_var.get().strip()
-        report_dir = self.dir_var.get().strip()
-
-        if not plan_path or not os.path.isfile(plan_path):
-            messagebox.showerror("错误", "请选择有效的发货计划文件")
+        if not self.plan_paths:
+            messagebox.showerror("错误", "请选择送货单文件")
             return
+        for p in self.plan_paths:
+            if not os.path.isfile(p):
+                messagebox.showerror("错误", f"文件不存在：{p}")
+                return
+        report_dir = self.dir_var.get().strip()
         if not report_dir or not os.path.isdir(report_dir):
             messagebox.showerror("错误", "请选择有效的检验报告目录")
             return
@@ -580,14 +597,16 @@ class App:
         self.progress_var.set(0)
 
         threading.Thread(
-            target=self._do_update, args=(plan_path, report_dir),
+            target=self._do_update, args=(self.plan_paths, report_dir),
             daemon=True
         ).start()
 
-    def _do_update(self, plan_path, report_dir):
+    def _do_update(self, plan_paths, report_dir):
         try:
-            self._set_progress(0, "正在读取发货计划...")
-            items = read_shipping_plan(plan_path)
+            self._set_progress(0, "正在读取送货单...")
+            items = []
+            for p in plan_paths:
+                items.extend(read_shipping_plan(p))
             groups = group_by_part_no(items)
 
             # 构建任务列表 + 填充列表看板
